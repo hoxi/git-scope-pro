@@ -1,5 +1,6 @@
 package implementation.lineStatusTracker;
 
+import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.editor.Document;
@@ -11,6 +12,8 @@ import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.fileEditor.FileEditorManager;
 import com.intellij.openapi.fileEditor.FileEditorManagerListener;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Computable;
+import com.intellij.openapi.util.Disposer;
 import com.intellij.openapi.util.text.StringUtil;
 import com.intellij.openapi.vcs.VcsException;
 import com.intellij.openapi.vcs.changes.Change;
@@ -27,9 +30,8 @@ import org.jetbrains.annotations.Nullable;
 import java.lang.reflect.Method;
 import java.util.*;
 
-public class MyLineStatusTrackerImpl {
+public class MyLineStatusTrackerImpl implements Disposable {
     private static final Logger LOG = Logger.getInstance(MyLineStatusTrackerImpl.class);
-    private final Project project;
     private final MessageBusConnection messageBusConnection;
     private final Map<String, TrackerInfo> trackerInfoMap = new HashMap<>();
     private final LineStatusTrackerManagerI trackerManager;
@@ -45,12 +47,16 @@ public class MyLineStatusTrackerImpl {
         }
     }
 
-    public MyLineStatusTrackerImpl(Project project) {
-        this.project = project;
+    @Override
+    public void dispose() {
+        releaseAll();
+    }
+
+    public MyLineStatusTrackerImpl(Project project, Disposable parentDisposable) {
         this.trackerManager = project.getService(LineStatusTrackerManagerI.class);
 
         // Subscribe to file editor events
-        MessageBus messageBus = this.project.getMessageBus();
+        MessageBus messageBus = project.getMessageBus();
         this.messageBusConnection = messageBus.connect();
 
         // Listen to file open events
@@ -66,6 +72,8 @@ public class MyLineStatusTrackerImpl {
                     }
                 }
         );
+
+        Disposer.register(parentDisposable, this);
     }
 
     private boolean isDiffView(Editor editor) {
@@ -86,22 +94,45 @@ public class MyLineStatusTrackerImpl {
             return;
         }
 
-        // Update all open editors with the changes
-        ApplicationManager.getApplication().invokeLater(() -> {
-            Editor[] editors = EditorFactory.getInstance().getAllEditors();
-            for (Editor editor : editors) {
-                if (isDiffView(editor)) {
-                    Document doc = editor.getDocument();
-                    VirtualFile file = FileDocumentManager.getInstance().getFile(doc);
-                    continue;
+        // Move VFS operations to background thread
+        ApplicationManager.getApplication().executeOnPooledThread(() -> {
+            // Collect all necessary data from VFS in background thread with read action
+            Map<String, ContentRevision> fileToRevisionMap = collectFileRevisionMap(changes);
+
+            // Switch to EDT only for UI updates
+            ApplicationManager.getApplication().invokeLater(() -> {
+                Editor[] editors = EditorFactory.getInstance().getAllEditors();
+                for (Editor editor : editors) {
+                    if (isDiffView(editor)) {
+                        continue;
+                    }
+                    updateLineStatusByChangesForEditorSafe(editor, fileToRevisionMap);
+                    refreshEditor(editor);
                 }
-                updateLineStatusByChangesForEditor(editor, changes);
-                refreshEditor(editor);
-            }
+            });
         });
     }
 
-    private void updateLineStatusByChangesForEditor(Editor editor, Collection<Change> changes) {
+    private Map<String, ContentRevision> collectFileRevisionMap(Collection<Change> changes) {
+        return ApplicationManager.getApplication().runReadAction((Computable<Map<String, ContentRevision>>) () -> {
+            Map<String, ContentRevision> map = new HashMap<>();
+            for (Change change : changes) {
+                if (change == null) continue;
+
+                VirtualFile vcsFile = change.getVirtualFile(); // Safe on background thread
+                if (vcsFile == null) continue;
+
+                String filePath = vcsFile.getPath();
+                ContentRevision beforeRevision = change.getBeforeRevision();
+                if (beforeRevision != null) {
+                    map.put(filePath, beforeRevision);
+                }
+            }
+            return map;
+        });
+    }
+
+    private void updateLineStatusByChangesForEditorSafe(Editor editor, Map<String, ContentRevision> fileToRevisionMap) {
         if (editor == null) return;
 
         Document doc = editor.getDocument();
@@ -109,33 +140,12 @@ public class MyLineStatusTrackerImpl {
         if (file == null) return;
 
         String filePath = file.getPath();
+        ContentRevision contentRevision = fileToRevisionMap.get(filePath);
 
-        // Check for specific changes for this file
-        boolean isOperationUseful = false;
-        ContentRevision contentRevision = null;
-
-        // Look for matching change for this file
-        for (Change change : changes) {
-            if (change == null) continue;
-
-            VirtualFile vcsFile = change.getVirtualFile();
-            if (vcsFile == null) continue;
-
-            if (vcsFile.getPath().equals(filePath)) {
-                contentRevision = change.getBeforeRevision();
-                isOperationUseful = true;
-                break;
-            }
-        }
-
-        // If no match was found and no useful operation, use current content
         String content = "";
-        if (!isOperationUseful) {
+        if (contentRevision == null) {
             content = doc.getCharsSequence().toString();
-        }
-
-        // If we found a content revision, use it
-        if (contentRevision != null) {
+        } else {
             try {
                 String revisionContent = contentRevision.getContent();
                 if (revisionContent != null) {
@@ -235,7 +245,7 @@ public class MyLineStatusTrackerImpl {
         return null;
     }
 
-    private void requestLineStatusTracker(@Nullable Editor editor) {
+    private synchronized void requestLineStatusTracker(@Nullable Editor editor) {
         if (editor == null) return;
 
         VirtualFile file = FileDocumentManager.getInstance().getFile(editor.getDocument());
@@ -260,8 +270,7 @@ public class MyLineStatusTrackerImpl {
 
             // Force refresh of editor gutter after requesting tracker
             ApplicationManager.getApplication().invokeLater(() -> {
-                if (editor.getGutter() instanceof EditorGutterComponentEx) {
-                    EditorGutterComponentEx gutter = (EditorGutterComponentEx) editor.getGutter();
+                if (editor.getGutter() instanceof EditorGutterComponentEx gutter) {
                     gutter.revalidateMarkup();
                 }
             });
@@ -270,20 +279,19 @@ public class MyLineStatusTrackerImpl {
         }
     }
 
-    /**
-     * Clean up all trackers when the plugin is unloaded or project is closed
-     */
-    public void releaseAll() {
+    public synchronized void releaseAll() {
         for (Map.Entry<String, TrackerInfo> entry : trackerInfoMap.entrySet()) {
             try {
                 String filePath = entry.getKey();
                 TrackerInfo trackerInfo = entry.getValue();
+                Object requester = trackerInfo.requester;
 
                 VirtualFile file = LocalFileSystem.getInstance().findFileByPath(filePath);
                 if (file != null) {
                     Document document = FileDocumentManager.getInstance().getDocument(file);
                     if (document != null) {
-                        trackerManager.releaseTrackerFor(document, trackerInfo.requester);
+                        // Log before releasing for debugging
+                        trackerManager.releaseTrackerFor(document, requester);
                     }
                 }
             } catch (Exception e) {
@@ -292,6 +300,8 @@ public class MyLineStatusTrackerImpl {
         }
 
         trackerInfoMap.clear();
-        messageBusConnection.disconnect();
+        if (messageBusConnection != null) {
+            messageBusConnection.disconnect();
+        }
     }
 }
